@@ -1,0 +1,31 @@
+{
+  "name": "b12-m11-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "firebase-admin": "^13.8.0",
+    "mongodb": "^7.2.0",
+    "stripe": "^20.4.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MstMahfuzaAkter/ClubSphere_Server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MstMahfuzaAkter/ClubSphere_Server/issues"
+  },
+  "homepage": "https://github.com/MstMahfuzaAkter/ClubSphere_Server#readme"
+}
