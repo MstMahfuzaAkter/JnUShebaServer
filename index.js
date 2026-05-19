@@ -8,6 +8,8 @@ const {
   ObjectId,
 } = require("mongodb");
 
+const jwt = require("jsonwebtoken");
+
 const app = express();
 
 // ================= MIDDLEWARE =================
@@ -32,25 +34,41 @@ const client = new MongoClient(uri, {
 let usersCollection;
 let servicesCollection;
 let bookingsCollection;
+let chatsCollection; // ✅ CHAT ADDED
 
-// ================= CONNECT DATABASE =================
+// ================= CONNECT DB =================
 async function connectDB() {
-  try {
-    const db = client.db("shebatech");
+  const db = client.db("shebatech");
 
-    usersCollection = db.collection("users");
-    servicesCollection = db.collection("services");
-    bookingsCollection = db.collection("bookings");
+  usersCollection = db.collection("users");
+  servicesCollection = db.collection("services");
+  bookingsCollection = db.collection("bookings");
+  chatsCollection = db.collection("chats"); // ✅ FIXED
 
-    console.log("✅ MongoDB Connected");
-  } catch (error) {
-    console.log("❌ DB Connection Error:", error);
-  }
+  console.log("✅ MongoDB Connected");
 }
 
-// =====================================================
-// ===================== ROUTES ========================
-// =====================================================
+// ================= ADMIN VERIFY =================
+const verifyAdmin = (req, res, next) => {
+  const token = req.headers.authorization;
+
+  if (!token) {
+    return res.status(401).send({ message: "Unauthorized" });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    if (decoded.role !== "admin") {
+      return res.status(403).send({ message: "Forbidden" });
+    }
+
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).send({ message: "Invalid token" });
+  }
+};
 
 // ================= HOME =================
 app.get("/", (req, res) => {
@@ -58,420 +76,250 @@ app.get("/", (req, res) => {
 });
 
 // =====================================================
-// ================= USER ROUTES =======================
+// ================= USER AUTH =========================
 // =====================================================
 
-// ================= REGISTER =================
 app.post("/users", async (req, res) => {
   try {
     const user = req.body;
 
-    // validation
-    if (
-      !user.name ||
-      !user.email ||
-      !user.password ||
-      !user.role
-    ) {
-      return res.status(400).send({
-        success: false,
-        message: "Missing required fields",
-      });
+    const exist = await usersCollection.findOne({ email: user.email });
+    if (exist) {
+      return res.status(409).send({ success: false, message: "User exists" });
     }
 
-    // existing check
-    const existingUser = await usersCollection.findOne({
-      email: user.email,
-    });
-
-    if (existingUser) {
-      return res.status(409).send({
-        success: false,
-        message: "User already exists",
-      });
-    }
-
-    // create user
     const result = await usersCollection.insertOne({
       ...user,
       createdAt: new Date(),
     });
 
-    // get inserted user
-    const newUser = await usersCollection.findOne({
-      _id: result.insertedId,
-    });
-
-    res.send({
-      success: true,
-      message: "Account created successfully",
-      user: newUser,
-    });
-  } catch (error) {
-    console.log(error);
-
-    res.status(500).send({
-      success: false,
-      message: "Server error",
-    });
+    res.send({ success: true, result });
+  } catch (err) {
+    res.status(500).send({ success: false });
   }
 });
 
-// ================= LOGIN =================
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    // check email
     const user = await usersCollection.findOne({ email });
 
-    if (!user) {
-      return res.status(404).send({
-        success: false,
-        message: "User not found",
-      });
-    }
+    if (!user)
+      return res.status(404).send({ success: false, message: "Not found" });
 
-    // password check
-    if (user.password !== password) {
-      return res.status(401).send({
-        success: false,
-        message: "Incorrect password",
-      });
-    }
+    if (user.password !== password)
+      return res.status(401).send({ success: false, message: "Wrong pass" });
 
-    res.send({
-      success: true,
-      message: "Login successful",
-      user,
-    });
-  } catch (error) {
-    console.log(error);
-
-    res.status(500).send({
-      success: false,
-      message: "Server error",
-    });
-  }
-});
-
-// ================= GET USER BY EMAIL =================
-app.get("/users/:email", async (req, res) => {
-  try {
-    const email = req.params.email;
-
-    const user = await usersCollection.findOne({
-      email,
-    });
-
-    if (!user) {
-      return res.status(404).send({
-        success: false,
-        message: "User not found",
-      });
-    }
-
-    res.send(user);
-  } catch (error) {
-    console.log(error);
-
-    res.status(500).send({
-      success: false,
-      message: "Server error",
-    });
-  }
-});
-
-// ================= UPDATE USER =================
-app.put("/users/:email", async (req, res) => {
-  try {
-    const email = req.params.email;
-    const updatedData = req.body;
-
-    const result = await usersCollection.updateOne(
-      { email },
-      {
-        $set: {
-          ...updatedData,
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).send({
-        success: false,
-        message: "User not found",
-      });
-    }
-
-    const updatedUser = await usersCollection.findOne({
-      email,
-    });
-
-    res.send({
-      success: true,
-      message: "Profile updated successfully",
-      user: updatedUser,
-    });
-  } catch (error) {
-    console.log(error);
-
-    res.status(500).send({
-      success: false,
-      message: "Update failed",
-    });
-  }
-});
-
-// =====================================================
-// ================= SERVICE ROUTES ====================
-// =====================================================
-
-// ================= ADD SERVICE =================
-app.post("/services", async (req, res) => {
-  try {
-    const service = req.body;
-
-    if (!service.title || !service.providerEmail || !service.price) {
-      return res.status(400).send({
-        success: false,
-        message: "Missing required fields",
-      });
-    }
-
-    const newService = {
-      title: service.title,
-      price: Number(service.price),
-      description: service.description || "",
-      category: service.category || "general",
-      location: service.location || "",
-      providerEmail: service.providerEmail,
-      providerName: service.providerName || "",
-      createdAt: new Date(),
-    };
-
-    const result = await servicesCollection.insertOne(newService);
-
-    res.send({
-      success: true,
-      message: "Service added successfully",
-      serviceId: result.insertedId,
-    });
-  } catch (error) {
-    console.log(error);
-    res.status(500).send({ success: false, message: "Server error" });
-  }
-});
-// ================= UPDATE SERVICE =================
-app.put("/services/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const updated = req.body;
-
-    const result = await servicesCollection.updateOne(
-      { _id: new ObjectId(id) },
-      {
-        $set: {
-          ...updated,
-          price: Number(updated.price),
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    res.send({
-      success: true,
-      message: "Service updated",
-      result,
-    });
-  } catch (error) {
-    console.log(error);
+    res.send({ success: true, user });
+  } catch (err) {
     res.status(500).send({ success: false });
   }
 });
-// ================= GET ALL SERVICES =================
-app.get("/services", async (req, res) => {
-  try {
-    const services = await servicesCollection
-      .find()
-      .sort({ createdAt: -1 })
-      .toArray();
 
-    res.send(services);
-  } catch (error) {
-    console.log(error);
-
-    res.status(500).send({
-      success: false,
-      message: "Failed to fetch services",
-    });
-  }
+app.get("/users/:email", async (req, res) => {
+  const user = await usersCollection.findOne({ email: req.params.email });
+  res.send(user);
 });
 
-// ================= GET PROVIDER SERVICES =================
+app.put("/users/:email", async (req, res) => {
+  await usersCollection.updateOne(
+    { email: req.params.email },
+    { $set: { ...req.body, updatedAt: new Date() } }
+  );
+
+  res.send({ success: true });
+});
+
+// =====================================================
+// ================= SERVICES ==========================
+// =====================================================
+
+app.post("/services", async (req, res) => {
+  const service = req.body;
+
+  const newService = {
+    title: service.title,
+    description: service.description,
+    price: Number(service.price),
+    category: service.category,
+    location: service.location,
+    providerEmail: service.providerEmail,
+    phone: service.phone,
+    createdAt: new Date().toISOString(),
+  };
+
+  const result = await servicesCollection.insertOne(newService);
+
+  res.send({
+    success: true,
+    insertedId: result.insertedId,
+  });
+});
+
+app.get("/services", async (req, res) => {
+  const data = await servicesCollection
+    .find()
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  res.send(data);
+});
+
+app.get("/services/:id", async (req, res) => {
+  try {
+    const service = await servicesCollection.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+
+    if (!service) {
+      return res.status(404).send({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    res.send(service);
+  } catch (err) {
+    res.status(500).send({ success: false });
+  }
+});
+// ================= PROVIDER SERVICES =================
 app.get("/services/provider/:email", async (req, res) => {
   try {
     const email = req.params.email;
 
-    const services = await servicesCollection
-      .find({
-        providerEmail: email,
-      })
+    const data = await servicesCollection
+      .find({ providerEmail: email })
+      .sort({ createdAt: -1 })
       .toArray();
 
-    res.send(services);
-  } catch (error) {
-    console.log(error);
-
+    res.send(data);
+  } catch (err) {
     res.status(500).send({
       success: false,
-      message: "Failed to fetch provider services",
+      message: "Failed to load provider services",
     });
   }
 });
+app.put("/services/:id", async (req, res) => {
+  await servicesCollection.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: { ...req.body, updatedAt: new Date() } }
+  );
 
-// ================= DELETE SERVICE =================
+  res.send({ success: true });
+});
+
 app.delete("/services/:id", async (req, res) => {
+  await servicesCollection.deleteOne({
+    _id: new ObjectId(req.params.id),
+  });
+
+  res.send({ success: true });
+});
+
+// =====================================================
+// ================= BOOKINGS ==========================
+// =====================================================
+
+app.post("/bookings", async (req, res) => {
+  const booking = req.body;
+
+  const result = await bookingsCollection.insertOne({
+    ...booking,
+    status: "pending",
+    createdAt: new Date(),
+  });
+
+  res.send(result);
+});
+
+app.get("/bookings/user/:email", async (req, res) => {
+  const data = await bookingsCollection
+    .find({ userEmail: req.params.email })
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  res.send(data);
+});
+
+app.get("/provider-bookings/:email", async (req, res) => {
+  const data = await bookingsCollection
+    .find({ providerEmail: req.params.email })
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  res.send(data);
+});
+
+app.get("/bookings/:id", async (req, res) => {
+  const data = await bookingsCollection.findOne({
+    _id: new ObjectId(req.params.id),
+  });
+
+  res.send(data);
+});
+
+app.patch("/bookings/:id", async (req, res) => {
+  const { status } = req.body;
+
+  const allowed = ["pending", "accepted", "rejected"];
+
+  if (!allowed.includes(status)) {
+    return res.status(400).send({ success: false });
+  }
+
+  await bookingsCollection.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    {
+      $set: {
+        status,
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  res.send({ success: true });
+});
+
+app.delete("/bookings/:id", async (req, res) => {
   try {
     const id = req.params.id;
+    const { email } = req.body;
 
-    const result = await servicesCollection.deleteOne({
+    // 🔥 booking find
+    const booking = await bookingsCollection.findOne({
       _id: new ObjectId(id),
     });
 
-    res.send({
-      success: true,
-      message: "Service deleted",
-      result,
-    });
-  } catch (error) {
-    console.log(error);
-
-    res.status(500).send({
-      success: false,
-      message: "Delete failed",
-    });
-  }
-});
-
-// =====================================================
-// ================= BOOKING ROUTES ====================
-// =====================================================
-
-// ================= CREATE BOOKING =================
-app.post("/bookings", async (req, res) => {
-  try {
-    const booking = req.body;
-
-    if (!booking.serviceId || !booking.userEmail || !booking.providerEmail) {
-      return res.status(400).send({
-        success: false,
-        message: "Missing booking fields",
-      });
-    }
-
-    const result = await bookingsCollection.insertOne({
-      ...booking,
-      status: "pending",
-      createdAt: new Date(),
-    });
-
-    res.send({
-      success: true,
-      message: "Booking created",
-      result,
-    });
-
-  } catch (error) {
-    res.status(500).send({ success: false });
-  }
-});
-
-// ================= GET USER BOOKINGS =================
-app.get("/bookings/user/:email", async (req, res) => {
-  try {
-    const email = req.params.email;
-
-    const bookings = await bookingsCollection
-      .find({
-        userEmail: email,
-      })
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.send(bookings);
-  } catch (error) {
-    console.log(error);
-
-    res.status(500).send({
-      success: false,
-      message: "Failed to fetch bookings",
-    });
-  }
-});
-
-// ================= PROVIDER BOOKINGS =================
-app.get("/provider-bookings/:email", async (req, res) => {
-  try {
-    const email = req.params.email;
-
-    const bookings = await bookingsCollection
-      .find({
-        providerEmail: email,
-      })
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.send(bookings);
-  } catch (error) {
-    console.log(error);
-
-    res.status(500).send({
-      success: false,
-      message: "Failed to fetch bookings",
-    });
-  }
-});
-
-// ================= UPDATE BOOKING STATUS =================
-app.patch("/bookings/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const { status } = req.body;
-
-    const allowed = ["pending", "accepted", "rejected"];
-
-    if (!allowed.includes(status)) {
-      return res.status(400).send({
-        success: false,
-        message: "Invalid status",
-      });
-    }
-
-    const result = await bookingsCollection.updateOne(
-      { _id: new ObjectId(id) },
-      {
-        $set: {
-          status,
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    if (result.matchedCount === 0) {
+    // booking not found
+    if (!booking) {
       return res.status(404).send({
         success: false,
         message: "Booking not found",
       });
     }
 
+    // 🔥 email check
+    if (booking.userEmail !== email) {
+      return res.status(403).send({
+        success: false,
+        message: "You cannot cancel this booking",
+      });
+    }
+
+    // 🔥 delete booking
+    const result = await bookingsCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
     res.send({
       success: true,
-      message: `Booking ${status}`,
+      message: "Booking cancelled successfully",
     });
-  } catch (error) {
-    console.log(error);
+
+  } catch (err) {
     res.status(500).send({
       success: false,
       message: "Server error",
@@ -479,8 +327,42 @@ app.patch("/bookings/:id", async (req, res) => {
   }
 });
 // =====================================================
-// ================= ADMIN ROUTES ======================
+// ================= ADMIN =============================
 // =====================================================
+
+// ADMIN STATS
+app.get("/admin-stats", async (req, res) => {
+  try {
+    const totalUsers = await usersCollection.countDocuments();
+
+    const totalStudents = await usersCollection.countDocuments({
+      role: "student",
+    });
+
+    const totalProviders = await usersCollection.countDocuments({
+      role: "provider",
+    });
+
+    const totalServices = await servicesCollection.countDocuments();
+
+    const totalBookings = await bookingsCollection.countDocuments();
+
+    res.send({
+      totalUsers,
+      totalStudents,
+      totalProviders,
+      totalServices,
+      totalBookings,
+    });
+  } catch (err) {
+    res.status(500).send({
+      success: false,
+      message: "Failed to load admin stats",
+    });
+  }
+});
+
+// ALL BOOKINGS FOR ADMIN
 app.get("/admin/bookings", async (req, res) => {
   try {
     const bookings = await bookingsCollection
@@ -489,68 +371,44 @@ app.get("/admin/bookings", async (req, res) => {
       .toArray();
 
     res.send(bookings);
-  } catch (error) {
+  } catch (err) {
     res.status(500).send({
       success: false,
-      message: "Failed to fetch bookings",
+      message: "Failed to load bookings",
     });
   }
 });
-// ================= ADMIN STATS =================
-app.get("/admin-stats", async (req, res) => {
+// =====================================================
+// ================= CHAT FIXED ========================
+// =====================================================
+
+// SEND MESSAGE
+app.post("/chat", async (req, res) => {
   try {
-    const totalUsers =
-      await usersCollection.countDocuments();
+    const msg = req.body;
 
-    const totalServices =
-      await servicesCollection.countDocuments();
-
-    const totalBookings =
-      await bookingsCollection.countDocuments();
-
-    const totalProviders =
-      await usersCollection.countDocuments({
-        role: "provider",
-      });
-
-    const totalStudents =
-      await usersCollection.countDocuments({
-        role: "student",
-      });
-
-    res.send({
-      totalUsers,
-      totalProviders,
-      totalStudents,
-      totalServices,
-      totalBookings,
+    const result = await chatsCollection.insertOne({
+      ...msg,
+      createdAt: new Date(),
     });
-  } catch (error) {
-    console.log(error);
 
-    res.status(500).send({
-      success: false,
-      message: "Failed to load stats",
-    });
+    res.send({ success: true, result });
+  } catch (err) {
+    res.status(500).send({ success: false });
   }
 });
 
-// ================= GET ALL USERS =================
-app.get("/all-users", async (req, res) => {
+// GET MESSAGES
+app.get("/chat/:id", async (req, res) => {
   try {
-    const users = await usersCollection
-      .find()
-      .sort({ createdAt: -1 })
+    const messages = await chatsCollection
+      .find({ serviceId: req.params.id })
+      .sort({ createdAt: 1 })
       .toArray();
 
-    res.send(users);
-  } catch (error) {
-    console.log(error);
-
-    res.status(500).send({
-      success: false,
-      message: "Failed to fetch users",
-    });
+    res.send(messages);
+  } catch (err) {
+    res.status(500).send({ success: false });
   }
 });
 
@@ -558,7 +416,7 @@ app.get("/all-users", async (req, res) => {
 // ================= START SERVER ======================
 // =====================================================
 
-async function startServer() {
+async function start() {
   await connectDB();
 
   app.listen(PORT, () => {
@@ -566,4 +424,4 @@ async function startServer() {
   });
 }
 
-startServer();
+start();
