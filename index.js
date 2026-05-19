@@ -136,25 +136,49 @@ app.put("/users/:email", async (req, res) => {
 // =====================================================
 
 app.post("/services", async (req, res) => {
-  const service = req.body;
+  try {
+    const service = req.body;
 
-  const newService = {
-    title: service.title,
-    description: service.description,
-    price: Number(service.price),
-    category: service.category,
-    location: service.location,
-    providerEmail: service.providerEmail,
-    phone: service.phone,
-    createdAt: new Date().toISOString(),
-  };
+    const newService = {
+      title: service.title,
+      description: service.description,
 
-  const result = await servicesCollection.insertOne(newService);
+      price: Number(service.price),
 
-  res.send({
-    success: true,
-    insertedId: result.insertedId,
-  });
+      category: service.category,
+      location: service.location,
+
+      providerName: service.providerName,
+      providerEmail: service.providerEmail,
+
+      phone: service.phone || "",
+
+      image: service.image || "",
+
+      rating: 0,
+      totalReviews: 0,
+
+      status: "active",
+
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await servicesCollection.insertOne(newService);
+
+    res.send({
+      success: true,
+      insertedId: result.insertedId,
+    });
+
+  } catch (err) {
+    console.log(err);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to create service",
+    });
+  }
 });
 
 app.get("/services", async (req, res) => {
