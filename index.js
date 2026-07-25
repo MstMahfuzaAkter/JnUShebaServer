@@ -144,9 +144,24 @@ app.post("/login", async (req, res) => {
   }
 });
 
-app.get("/users/:email", async (req, res) => {
-  const user = await usersCollection.findOne({ email: req.params.email });
-  res.send(user);
+app.get("/users/:identifier", async (req, res) => {
+  try {
+    const identifier = req.params.identifier;
+    let query = { email: identifier };
+
+    // যদি প্যারামিটারটি একটি বৈধ MongoDB ObjectId হয়, তবে আইডি দিয়েও খুঁজবে
+    if (ObjectId.isValid(identifier)) {
+      query = { $or: [{ _id: new ObjectId(identifier) }, { email: identifier }] };
+    }
+
+    const user = await usersCollection.findOne(query);
+    if (!user) {
+      return res.status(404).send({ success: false, message: "User not found" });
+    }
+    res.send(user);
+  } catch (err) {
+    res.status(500).send({ success: false, error: err.message });
+  }
 });
 
 app.put("/users/:email", async (req, res) => {
