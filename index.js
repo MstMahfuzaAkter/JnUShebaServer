@@ -73,9 +73,41 @@ async function connectDB() {
   console.log("✅ MongoDB Connected");
 }
 
+// ================= AUTH HELPERS =================
+
+// Accepts either a raw token ("xxx.yyy.zzz") or the conventional
+// "Bearer xxx.yyy.zzz" format, so the frontend doesn't have to guess which
+// one the backend expects.
+const extractToken = (req) => {
+  const header = req.headers.authorization;
+  if (!header) return null;
+  return header.startsWith("Bearer ") ? header.split(" ")[1] : header;
+};
+
+// ================= GENERIC AUTH VERIFY =================
+// FIX: previously only an admin-only verifier existed, so any endpoint that
+// just needed "is this a logged-in user" (like reading/saving their own
+// settings) had no middleware to use. This verifies any valid token and
+// attaches the decoded payload to req.user.
+const verifyToken = (req, res, next) => {
+  const token = extractToken(req);
+
+  if (!token) {
+    return res.status(401).send({ message: "Unauthorized" });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).send({ message: "Invalid token" });
+  }
+};
+
 // ================= ADMIN VERIFY =================
 const verifyAdmin = (req, res, next) => {
-  const token = req.headers.authorization;
+  const token = extractToken(req);
 
   if (!token) {
     return res.status(401).send({ message: "Unauthorized" });
@@ -93,6 +125,19 @@ const verifyAdmin = (req, res, next) => {
   } catch (err) {
     return res.status(401).send({ message: "Invalid token" });
   }
+};
+
+// FIX: a logged-in user (or an admin) should be able to act on a given
+// email's settings — anyone else shouldn't, even with a valid token.
+const verifySelfOrAdmin = (req, res, next) => {
+  const targetEmail = req.params.email?.toLowerCase();
+  const requesterEmail = req.user?.email?.toLowerCase();
+
+  if (req.user?.role === "admin" || requesterEmail === targetEmail) {
+    return next();
+  }
+
+  return res.status(403).send({ message: "Forbidden" });
 };
 
 // ================= HOME =================
@@ -117,6 +162,16 @@ app.post("/users", async (req, res) => {
       email,
       role: user.role || "student",
       isApproved: user.role === "provider" ? false : true,
+
+      // Settings defaults — FIX: these fields used to only exist if the
+      // client happened to send them; now every new user gets sane
+      // defaults so profile/settings screens never render "undefined".
+      themeMode: user.themeMode || "light",
+      notificationEnabled:
+        user.notificationEnabled !== undefined ? user.notificationEnabled : true,
+      locationEnabled:
+        user.locationEnabled !== undefined ? user.locationEnabled : true,
+
       createdAt: new Date(),
     };
 
@@ -130,7 +185,7 @@ app.post("/users", async (req, res) => {
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await usersCollection.findOne({ email });
+    const user = await usersCollection.findOne({ email: email?.trim().toLowerCase() });
 
     if (!user)
       return res.status(404).send({ success: false, message: "Not found" });
@@ -138,7 +193,18 @@ app.post("/login", async (req, res) => {
     if (user.password !== password)
       return res.status(401).send({ success: false, message: "Wrong pass" });
 
-    res.send({ success: true, user });
+    // FIX: /login never actually issued a token before, so any
+    // route protected by verifyToken/verifyAdmin was unreachable from the
+    // app after login. Now a JWT is signed and returned alongside the user.
+    const token = jwt.sign(
+      { id: user._id, email: user.email, role: user.role || "student" },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    const { password: _pw, ...safeUser } = user;
+
+    res.send({ success: true, user: safeUser, token });
   } catch (err) {
     res.status(500).send({ success: false });
   }
@@ -149,12 +215,14 @@ app.get("/users/:identifier", async (req, res) => {
     const identifier = req.params.identifier;
     let query = { email: identifier };
 
-    // যদি প্যারামিটারটি একটি বৈধ MongoDB ObjectId হয়, তবে আইডি দিয়েও খুঁজবে
+    // যদি প্যারামিটারটি একটি বৈধ MongoDB ObjectId হয়, তবে আইডি দিয়েও খুঁজবে
     if (ObjectId.isValid(identifier)) {
       query = { $or: [{ _id: new ObjectId(identifier) }, { email: identifier }] };
     }
 
-    const user = await usersCollection.findOne(query);
+    // FIX: this used to return the full document, including the raw
+    // password field, straight to the client. Now it's excluded.
+    const user = await usersCollection.findOne(query, { projection: { password: 0 } });
     if (!user) {
       return res.status(404).send({ success: false, message: "User not found" });
     }
@@ -165,15 +233,25 @@ app.get("/users/:identifier", async (req, res) => {
 });
 
 app.put("/users/:email", async (req, res) => {
+  // FIX: this endpoint used to blindly $set whatever the client sent,
+  // which meant anyone who could reach it could overwrite role,
+  // isApproved, or even password. It's now restricted to profile-safe
+  // fields; use /admin/user-role/:id for role changes and
+  // /users/settings/:email for theme/notification/location.
+  const { role, isApproved, password, email, _id, ...safeUpdates } = req.body;
+
   await usersCollection.updateOne(
     { email: req.params.email },
-    { $set: { ...req.body, updatedAt: new Date() } }
+    { $set: { ...safeUpdates, updatedAt: new Date() } }
   );
   res.send({ success: true });
 });
 
 app.get("/users", async (req, res) => {
-  const users = await usersCollection.find().toArray();
+  const users = await usersCollection
+    .find()
+    .project({ password: 0 })
+    .toArray();
   res.send(users);
 });
 
@@ -200,6 +278,100 @@ app.patch("/admin/user-role/:id", async (req, res) => {
     res.send({ success: true });
   } catch (err) {
     res.status(500).send({ success: false });
+  }
+});
+
+// =====================================================
+// ================= USER SETTINGS =====================
+// =====================================================
+// New: dedicated, whitelisted settings endpoints so theme/notification/
+// location preferences persist in the database (survive app reinstall +
+// re-login) without exposing the generic /users/:email update route to
+// arbitrary field injection.
+
+app.get("/users/settings/:email", verifyToken, verifySelfOrAdmin, async (req, res) => {
+  try {
+    const email = req.params.email.trim().toLowerCase();
+
+    const user = await usersCollection.findOne(
+      { email },
+      {
+        projection: {
+          name: 1,
+          email: 1,
+          themeMode: 1,
+          notificationEnabled: 1,
+          locationEnabled: 1,
+        },
+      }
+    );
+
+    if (!user) {
+      return res.status(404).send({ success: false, message: "User not found" });
+    }
+
+    res.status(200).send({
+      success: true,
+      name: user.name,
+      email: user.email,
+      themeMode: user.themeMode || "light",
+      notificationEnabled:
+        user.notificationEnabled !== undefined ? user.notificationEnabled : true,
+      locationEnabled:
+        user.locationEnabled !== undefined ? user.locationEnabled : true,
+    });
+  } catch (err) {
+    res.status(500).send({ success: false, message: err.message });
+  }
+});
+
+app.put("/users/settings/:email", verifyToken, verifySelfOrAdmin, async (req, res) => {
+  try {
+    const email = req.params.email.trim().toLowerCase();
+    const { themeMode, notificationEnabled, locationEnabled } = req.body;
+
+    const allowedThemes = ["light", "dark"];
+    if (themeMode !== undefined && !allowedThemes.includes(themeMode)) {
+      return res.status(400).send({ success: false, message: "Invalid themeMode" });
+    }
+
+    const updates = {
+      ...(themeMode !== undefined && { themeMode }),
+      ...(notificationEnabled !== undefined && { notificationEnabled: Boolean(notificationEnabled) }),
+      ...(locationEnabled !== undefined && { locationEnabled: Boolean(locationEnabled) }),
+      updatedAt: new Date(),
+    };
+
+    const updatedUser = await usersCollection.findOneAndUpdate(
+      { email },
+      { $set: updates },
+      {
+        returnDocument: "after",
+        projection: {
+          name: 1,
+          email: 1,
+          themeMode: 1,
+          notificationEnabled: 1,
+          locationEnabled: 1,
+        },
+      }
+    );
+
+    if (!updatedUser) {
+      return res.status(404).send({ success: false, message: "User not found" });
+    }
+
+    res.status(200).send({
+      success: true,
+      message: "Settings updated successfully",
+      settings: {
+        themeMode: updatedUser.themeMode,
+        notificationEnabled: updatedUser.notificationEnabled,
+        locationEnabled: updatedUser.locationEnabled,
+      },
+    });
+  } catch (err) {
+    res.status(500).send({ success: false, message: err.message });
   }
 });
 
@@ -664,14 +836,90 @@ app.delete("/bookings/:id", async (req, res) => {
 // ================= REVIEWS ===========================
 // =====================================================
 
+// Shared helper: recompute a service's rating/totalReviews from whatever
+// is currently in its embedded `reviews` array, rounded to 1 decimal so the
+// UI never has to deal with long floating-point tails. Used by both the
+// add-review and delete-review endpoints so they can never drift apart.
+async function recalculateServiceRating(serviceId) {
+  const service = await servicesCollection.findOne({
+    _id: new ObjectId(serviceId),
+  });
+
+  if (!service) return null;
+
+  const reviews = service.reviews || [];
+  const totalReviews = reviews.length;
+  const avgRating = totalReviews
+    ? Number((reviews.reduce((sum, r) => sum + (Number(r.rating) || 0), 0) / totalReviews).toFixed(1))
+    : 0;
+
+  await servicesCollection.updateOne(
+    { _id: new ObjectId(serviceId) },
+    { $set: { rating: avgRating, totalReviews } }
+  );
+
+  return { rating: avgRating, totalReviews };
+}
+
 app.post("/reviews", async (req, res) => {
   try {
     const review = req.body;
 
-    const result = await reviewsCollection.insertOne({
-      ...review,
-      createdAt: new Date(),
+    // ---- Basic validation (FIX: previously nothing was validated, so a
+    // missing/invalid serviceId or an out-of-range rating could either
+    // crash the request or silently store bad data). ----
+    if (!review.serviceId || !ObjectId.isValid(review.serviceId)) {
+      return res.status(400).send({ success: false, message: "Valid serviceId is required" });
+    }
+
+    const ratingNum = Number(review.rating);
+    if (!ratingNum || ratingNum < 1 || ratingNum > 5) {
+      return res.status(400).send({ success: false, message: "Rating must be between 1 and 5" });
+    }
+
+    if (!review.comment || !review.comment.trim()) {
+      return res.status(400).send({ success: false, message: "Comment is required" });
+    }
+
+    const service = await servicesCollection.findOne({
+      _id: new ObjectId(review.serviceId),
     });
+
+    if (!service) {
+      return res.status(404).send({ success: false, message: "Service not found" });
+    }
+
+    // ---- Prevent duplicate reviews on the same booking (FIX: bookings
+    // already track `isReviewed`, but nothing ever set it, so a student
+    // could review the same booking repeatedly). ----
+    let booking = null;
+    if (review.bookingId && ObjectId.isValid(review.bookingId)) {
+      booking = await bookingsCollection.findOne({ _id: new ObjectId(review.bookingId) });
+
+      if (booking?.isReviewed) {
+        return res.status(409).send({ success: false, message: "This booking has already been reviewed" });
+      }
+    }
+
+    const userEmail = review.userEmail || review.customerEmail;
+
+    // FIX: providerEmail used to come straight from whatever the client
+    // sent (or nothing at all), so GET /reviews/:providerEmail was
+    // unreliable. It's now always taken from the service document itself,
+    // which is the single source of truth for who owns this service.
+    const providerEmail = service.providerEmail;
+
+    const reviewDoc = {
+      serviceId: review.serviceId,
+      bookingId: review.bookingId || null,
+      providerEmail,
+      userEmail,
+      rating: ratingNum,
+      comment: review.comment.trim(),
+      createdAt: new Date(),
+    };
+
+    const result = await reviewsCollection.insertOne(reviewDoc);
 
     await servicesCollection.updateOne(
       { _id: new ObjectId(review.serviceId) },
@@ -679,36 +927,29 @@ app.post("/reviews", async (req, res) => {
         $push: {
           reviews: {
             _id: result.insertedId,
-            userEmail: review.userEmail || review.customerEmail,
-            rating: review.rating,
-            comment: review.comment,
-            createdAt: new Date(),
+            userEmail,
+            rating: ratingNum,
+            comment: reviewDoc.comment,
+            createdAt: reviewDoc.createdAt,
           },
         },
       }
     );
 
-    const service = await servicesCollection.findOne({
-      _id: new ObjectId(review.serviceId),
-    });
+    const { rating, totalReviews } = await recalculateServiceRating(review.serviceId);
 
-    const reviews = service.reviews || [];
-    const totalRating = reviews.reduce((sum, r) => sum + r.rating, 0);
-    const avgRating = reviews.length ? totalRating / reviews.length : 0;
-
-    await servicesCollection.updateOne(
-      { _id: new ObjectId(review.serviceId) },
-      {
-        $set: {
-          rating: avgRating,
-          totalReviews: reviews.length,
-        },
-      }
-    );
+    if (booking) {
+      await bookingsCollection.updateOne(
+        { _id: booking._id },
+        { $set: { isReviewed: true, updatedAt: new Date() } }
+      );
+    }
 
     res.send({
       success: true,
       insertedId: result.insertedId,
+      rating,
+      totalReviews,
     });
   } catch (err) {
     console.log(err);
@@ -734,6 +975,49 @@ app.get("/reviews/:providerEmail", async (req, res) => {
       success: false,
       message: "Failed to load reviews",
     });
+  }
+});
+
+// New: deleting a review used to leave the service's rating/totalReviews
+// stale forever, since nothing recalculated them afterward.
+app.delete("/reviews/:id", verifyToken, async (req, res) => {
+  try {
+    const reviewId = req.params.id;
+    if (!ObjectId.isValid(reviewId)) {
+      return res.status(400).send({ success: false, message: "Invalid review id" });
+    }
+
+    const review = await reviewsCollection.findOne({ _id: new ObjectId(reviewId) });
+    if (!review) {
+      return res.status(404).send({ success: false, message: "Review not found" });
+    }
+
+    // Only the review author or an admin can remove it.
+    const isOwner = review.userEmail?.toLowerCase() === req.user?.email?.toLowerCase();
+    if (!isOwner && req.user?.role !== "admin") {
+      return res.status(403).send({ success: false, message: "Forbidden" });
+    }
+
+    await reviewsCollection.deleteOne({ _id: new ObjectId(reviewId) });
+
+    await servicesCollection.updateOne(
+      { _id: new ObjectId(review.serviceId) },
+      { $pull: { reviews: { _id: new ObjectId(reviewId) } } }
+    );
+
+    const { rating, totalReviews } = await recalculateServiceRating(review.serviceId);
+
+    if (review.bookingId && ObjectId.isValid(review.bookingId)) {
+      await bookingsCollection.updateOne(
+        { _id: new ObjectId(review.bookingId) },
+        { $set: { isReviewed: false, updatedAt: new Date() } }
+      );
+    }
+
+    res.send({ success: true, rating, totalReviews });
+  } catch (err) {
+    console.log(err);
+    res.status(500).send({ success: false, message: "Failed to delete review" });
   }
 });
 
@@ -768,6 +1052,7 @@ app.get("/admin/providers/pending", async (req, res) => {
   try {
     const data = await usersCollection
       .find({ role: "provider", isApproved: false })
+      .project({ password: 0 })
       .toArray();
 
     res.send(data);
@@ -881,13 +1166,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// =====================================================
-// ================= SSLCOMMERZ PAYMENT ================
-// =====================================================
-
-// =====================================================
-// ================= SSLCOMMERZ PAYMENT ================
-// =====================================================
 // =====================================================
 // ================= SSLCOMMERZ PAYMENT ================
 // =====================================================
@@ -1113,7 +1391,7 @@ app.get("/admin/transactions", async (req, res) => {
   }
 });
 
-// 2. Provider: নির্দিষ্ট প্রোভাইডারের সব সার্ভিসের বুকিংয়ের পেমেন্ট/ট্রানজেকশন দেখার জন্য
+// 2. Provider: নির্দিষ্ট প্রোভাইডারের সব সার্ভিসের বুকিংয়ের পেমেন্ট/ট্রানজেকশন দেখার জন্য
 app.get("/provider/transactions/:email", async (req, res) => {
   try {
     const providerEmail = req.params.email;
@@ -1125,7 +1403,7 @@ app.get("/provider/transactions/:email", async (req, res) => {
 
     const bookingIds = bookings.map((b) => b._id);
 
-    // সেই বুকিংগুলোর পেমেন্ট রেকর্ডগুলো নিয়ে আসব
+    // সেই বুকিংগুলোর পেমেন্ট রেকর্ডগুলো নিয়ে আসব
     const transactions = await paymentsCollection
       .find({ bookingId: { $in: bookingIds } })
       .sort({ createdAt: -1 })
