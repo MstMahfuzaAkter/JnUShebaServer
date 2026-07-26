@@ -47,7 +47,6 @@ const store_id = process.env.SSLC_STORE_ID;
 const store_passwd = process.env.SSLC_STORE_PASSWD;
 const is_live = process.env.SSLC_IS_LIVE === "true"; // false = sandbox, true = live
 const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${PORT}`;
-
 // ================= COLLECTIONS =================
 let usersCollection;
 let servicesCollection;
@@ -70,7 +69,10 @@ async function connectDB() {
   reviewsCollection = db.collection("reviews");
   paymentsCollection = db.collection("payments"); // ✅ ADDED
 
-  console.log("✅ MongoDB Connected");
+  // 🛡️ ডুপ্লিকেট ট্রানজেকশন রোধ করতে payments কালেকশনে tran_id এর উপর ইউনিক ইনডেক্স নিশ্চিত করা
+  await paymentsCollection.createIndex({ tran_id: 1 }, { unique: true });
+
+  console.log("✅ MongoDB Connected & Unique Index Ensured on payments.tran_id");
 }
 
 // ================= AUTH HELPERS =================
@@ -1103,13 +1105,17 @@ app.get("/admin/bookings", async (req, res) => {
 // =====================================================
 // ================= CHAT (HTTP HISTORY) ================
 // =====================================================
-
+// Send / Save Chat Message
 app.post("/chat", async (req, res) => {
   try {
-    const msg = req.body;
+    const { serviceId, senderEmail, receiverEmail, text, clientEmail } = req.body;
 
     const result = await chatsCollection.insertOne({
-      ...msg,
+      serviceId,
+      senderEmail,
+      receiverEmail,
+      clientEmail, // কোন ক্লায়েন্টের সাথে চ্যাট তা ট্র্যাক করার জন্য
+      text,
       createdAt: new Date(),
     });
 
@@ -1119,10 +1125,25 @@ app.post("/chat", async (req, res) => {
   }
 });
 
+// Get Messages for a specific service and user pair
 app.get("/chat/:id", async (req, res) => {
   try {
+    const { id: serviceId } = req.params;
+    const { clientEmail } = req.query; // Query parameter থেকে ক্লায়েন্টের ইমেইল নেওয়া
+
+    let query = { serviceId };
+    
+    // যদি নির্দিষ্ট ক্লায়েন্ট ইমেইল পাস করা হয়, তবে শুধু তার এবং প্রোভাইডারের চ্যাট দেখাবে
+    if (clientEmail) {
+      query.$or = [
+        { clientEmail: clientEmail },
+        { senderEmail: clientEmail },
+        { receiverEmail: clientEmail }
+      ];
+    }
+
     const messages = await chatsCollection
-      .find({ serviceId: req.params.id })
+      .find(query)
       .sort({ createdAt: 1 })
       .toArray();
 
@@ -1131,7 +1152,6 @@ app.get("/chat/:id", async (req, res) => {
     res.status(500).send({ success: false });
   }
 });
-
 // =====================================================
 // ================= SOCKET.IO REAL-TIME CHAT ==========
 // =====================================================
@@ -1169,7 +1189,6 @@ io.on("connection", (socket) => {
 // =====================================================
 // ================= SSLCOMMERZ PAYMENT ================
 // =====================================================
-
 app.post("/payment/init", async (req, res) => {
   try {
     const { bookingId, amount, customerName, customerEmail, customerPhone, frontendUrl } = req.body;
@@ -1179,8 +1198,24 @@ app.post("/payment/init", async (req, res) => {
     }
 
     const booking = await bookingsCollection.findOne({ _id: new ObjectId(bookingId) });
-    const tran_id = uuidv4();
+    if (!booking) {
+      return res.status(404).send({ success: false, message: "Booking not found" });
+    }
 
+    // চেক করুন এই বুকিংয়ের বিপরীতে অলরেডি কোনো সফল পেমেন্ট আছে কি না
+    const existingPaidPayment = await paymentsCollection.findOne({ 
+      bookingId: new ObjectId(bookingId), 
+      status: "paid" 
+    });
+
+    if (existingPaidPayment) {
+      return res.status(400).send({ 
+        success: false, 
+        message: "This booking is already paid!" 
+      });
+    }
+
+    const tran_id = uuidv4();
     const clientRedirectUrl = frontendUrl || BACKEND_URL;
 
     const data = {
@@ -1211,6 +1246,7 @@ app.post("/payment/init", async (req, res) => {
       ship_country: "Bangladesh",
     };
 
+    // ডাটাবেজে পেন্ডিং পেমেন্ট সেভ করা (Unique Index এর কারণে ডুপ্লিকেট হওয়ার সুযোগ নেই)
     await paymentsCollection.insertOne({
       tran_id,
       bookingId: new ObjectId(bookingId),
@@ -1234,22 +1270,32 @@ app.post("/payment/init", async (req, res) => {
   }
 });
 
+// =====================================================
+// 2. PAYMENT SUCCESS (ডাবল ভ্যালিডেশন রোধ সহ)
+// =====================================================
 app.post("/payment/success", async (req, res) => {
   try {
     const { tran_id, val_id } = req.body;
     const { clientUrl, bookingId } = req.query;
 
+    const payment = await paymentsCollection.findOne({ tran_id });
+    if (!payment) {
+      return res.redirect(`${clientUrl || BACKEND_URL}/payment/result-page?status=fail`);
+    }
+
+    // যদি পেমেন্ট ইতিমধ্যে সফল বা পেইড হয়ে থাকে, তবে সরাসরি রিডাইরেক্ট করুন
+    if (payment.status === "paid") {
+      return res.redirect(`${clientUrl}/payment/result-page?status=success&bookingId=${payment.bookingId}`);
+    }
+
     const sslcz = new SSLCommerzPayment(store_id, store_passwd, is_live);
     const validation = await sslcz.validate({ val_id });
 
-    const isValid =
-      validation?.status === "VALID" || validation?.status === "VALIDATED";
+    const isValid = validation?.status === "VALID" || validation?.status === "VALIDATED";
 
-    const payment = await paymentsCollection.findOne({ tran_id });
-
-    if (isValid && payment) {
+    if (isValid) {
       await paymentsCollection.updateOne(
-        { tran_id },
+        { tran_id, status: { $ne: "paid" } },
         { $set: { status: "paid", validatedAt: new Date(), rawValidation: validation } }
       );
 
@@ -1269,12 +1315,15 @@ app.post("/payment/success", async (req, res) => {
   }
 });
 
+// =====================================================
+// 3. PAYMENT FAIL & CANCEL
+// =====================================================
 app.post("/payment/fail", async (req, res) => {
   const { clientUrl } = req.query;
   try {
     const { tran_id } = req.body;
     await paymentsCollection.updateOne(
-      { tran_id },
+      { tran_id, status: "pending" },
       { $set: { status: "failed", updatedAt: new Date() } }
     );
   } catch (err) {
@@ -1288,7 +1337,7 @@ app.post("/payment/cancel", async (req, res) => {
   try {
     const { tran_id } = req.body;
     await paymentsCollection.updateOne(
-      { tran_id },
+      { tran_id, status: "pending" },
       { $set: { status: "cancelled", updatedAt: new Date() } }
     );
   } catch (err) {
@@ -1297,17 +1346,20 @@ app.post("/payment/cancel", async (req, res) => {
   res.redirect(`${clientUrl || BACKEND_URL}/payment/result-page?status=cancel`);
 });
 
+// =====================================================
+// 4. IPN (Instant Payment Notification)
+// =====================================================
 app.post("/payment/ipn", async (req, res) => {
   try {
     const { tran_id, val_id, status } = req.body;
 
     if (status === "VALID") {
-      const sslcz = new SSLCommerzPayment(store_id, store_passwd, is_live);
-      const validation = await sslcz.validate({ val_id });
+      const payment = await paymentsCollection.findOne({ tran_id });
+      if (payment && payment.status !== "paid") {
+        const sslcz = new SSLCommerzPayment(store_id, store_passwd, is_live);
+        const validation = await sslcz.validate({ val_id });
 
-      if (validation?.status === "VALID" || validation?.status === "VALIDATED") {
-        const payment = await paymentsCollection.findOne({ tran_id });
-        if (payment) {
+        if (validation?.status === "VALID" || validation?.status === "VALIDATED") {
           await paymentsCollection.updateOne(
             { tran_id },
             { $set: { status: "paid", ipnValidatedAt: new Date() } }
@@ -1327,9 +1379,11 @@ app.post("/payment/ipn", async (req, res) => {
   }
 });
 
+// =====================================================
+// 5. RESULT PAGE & STATUS
+// =====================================================
 app.get("/payment/result-page", (req, res) => {
   const { status, bookingId } = req.query;
-
   res.send(`
     <html>
       <body style="font-family: sans-serif; text-align:center; padding-top: 60px;">
@@ -1351,12 +1405,11 @@ app.get("/payment/result-page", (req, res) => {
           function tryClose() {
             try { window.close(); } catch (e) {}
           }
-
           setTimeout(tryClose, 800);
 
           document.getElementById("closeBtn").addEventListener("click", function () {
             tryClose();
-            document.getElementById("msg").textContent = "You can close this tab manually now (use the × on the tab).";
+            document.getElementById("msg").textContent = "You can close this tab manually now.";
           });
         </script>
       </body>
@@ -1374,36 +1427,25 @@ app.get("/payment/status/:tran_id", async (req, res) => {
     res.status(500).send({ success: false, message: "Server error" });
   }
 });
-// =====================================================
-// ================= TRANSACTION HISTORIES ==============
-// =====================================================
 
-// 1. Admin: সব ট্রানজেকশন দেখার জন্য
+// =====================================================
+// 6. TRANSACTION HISTORIES (Admin, Provider, User)
+// =====================================================
 app.get("/admin/transactions", async (req, res) => {
   try {
-    const transactions = await paymentsCollection
-      .find()
-      .sort({ createdAt: -1 })
-      .toArray();
+    const transactions = await paymentsCollection.find().sort({ createdAt: -1 }).toArray();
     res.send({ success: true, transactions });
   } catch (err) {
     res.status(500).send({ success: false, message: "Failed to load admin transactions" });
   }
 });
 
-// 2. Provider: নির্দিষ্ট প্রোভাইডারের সব সার্ভিসের বুকিংয়ের পেমেন্ট/ট্রানজেকশন দেখার জন্য
 app.get("/provider/transactions/:email", async (req, res) => {
   try {
     const providerEmail = req.params.email;
-
-    // প্রথমে এই প্রোভাইডারের সার্ভিসগুলোর আইডিগুলো বের করে নেব বা বুকিং কালেকশন থেকে ফিল্টার করব
-    const bookings = await bookingsCollection
-      .find({ providerEmail: providerEmail })
-      .toArray();
-
+    const bookings = await bookingsCollection.find({ providerEmail: providerEmail }).toArray();
     const bookingIds = bookings.map((b) => b._id);
 
-    // সেই বুকিংগুলোর পেমেন্ট রেকর্ডগুলো নিয়ে আসব
     const transactions = await paymentsCollection
       .find({ bookingId: { $in: bookingIds } })
       .sort({ createdAt: -1 })
@@ -1415,16 +1457,10 @@ app.get("/provider/transactions/:email", async (req, res) => {
   }
 });
 
-// 3. Student/Customer: নির্দিষ্ট ইউজারের নিজের সব ট্রানজেকশন দেখার জন্য
 app.get("/user/transactions/:email", async (req, res) => {
   try {
     const userEmail = req.params.email;
-
-    const transactions = await paymentsCollection
-      .find({ userEmail: userEmail })
-      .sort({ createdAt: -1 })
-      .toArray();
-
+    const transactions = await paymentsCollection.find({ userEmail: userEmail }).sort({ createdAt: -1 }).toArray();
     res.send({ success: true, transactions });
   } catch (err) {
     res.status(500).send({ success: false, message: "Failed to load user transactions" });
